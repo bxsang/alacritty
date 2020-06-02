@@ -16,12 +16,13 @@ use crate::ansi::{
 };
 use crate::config::{BellAnimation, BellConfig, Config};
 use crate::event::{Event, EventListener};
-use crate::grid::{Dimensions, DisplayIter, Grid, IndexRegion, Indexed, Scroll};
+use crate::grid::{Dimensions, DisplayIter, Grid, GridCell, IndexRegion, Indexed, Scroll};
 use crate::index::{self, Boundary, Column, Direction, IndexRange, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange};
 use crate::term::cell::{Cell, Flags, LineLength};
 use crate::term::color::{CellRgb, Rgb, DIM_FACTOR};
 use crate::term::search::{RegexIter, RegexSearch};
+use crate::text_run::{RunStart, TextRun, TextRunContent, UIFlags};
 use crate::vi_mode::{ViModeCursor, ViMotion};
 
 pub mod cell;
@@ -124,6 +125,9 @@ impl<'a> RenderableSearch<'a> {
     }
 }
 
+type CharWidth = usize;
+type LatestCol = (Column, CharWidth);
+
 /// Iterator that yields cells needing render.
 ///
 /// Yields cells that require work to be displayed (that is, not a an empty
@@ -132,7 +136,7 @@ impl<'a> RenderableSearch<'a> {
 ///
 /// This manages the cursor during a render. The cursor location is inverted to
 /// draw it, and reverted after drawing to maintain state.
-pub struct RenderableCellsIter<'a, C> {
+pub struct TextRunIter<'a, C> {
     inner: DisplayIter<'a, Cell>,
     grid: &'a Grid<Cell>,
     cursor: RenderableCursor,
@@ -140,10 +144,15 @@ pub struct RenderableCellsIter<'a, C> {
     colors: &'a color::List,
     selection: Option<SelectionRange<Line>>,
     search: RenderableSearch<'a>,
+    run_start: Option<RunStart>,
+    latest_col: Option<LatestCol>,
+    buffer_text: String,
+    buffer_extra: Vec<Option<Vec<char>>>,
+    viewport_match: Option<RangeInclusive<Point>>,
 }
 
-impl<'a, C> Iterator for RenderableCellsIter<'a, C> {
-    type Item = RenderableCell;
+impl<'a, C> Iterator for TextRunIter<'a, C> {
+    type Item = TextRun;
 
     /// Gets the next renderable cell.
     ///
@@ -151,29 +160,95 @@ impl<'a, C> Iterator for RenderableCellsIter<'a, C> {
     /// (eg. invert fg and bg colors).
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        let mut output = None;
         loop {
             if self.cursor.point == self.inner.point() {
                 // Handle cursor rendering.
+                let selected = self.is_selected(self.cursor.point);
+                let buffer_point = self.grid.visible_to_buffer(self.cursor.point);
+                let search_matched = self.search.advance(buffer_point);
+                let mut uiflags = UIFlags::empty();
+                if selected {
+                    uiflags |= UIFlags::SELECTED;
+                }
+                if search_matched {
+                    uiflags |= UIFlags::SEARCH_MATCHED;
+                    if let Some(viewport_match) = &self.viewport_match {
+                        if viewport_match.contains(&self.cursor.point) {
+                            uiflags |= UIFlags::FOCUSED_MATCH;
+                        }
+                    }
+                }
                 if self.cursor.rendered {
-                    return self.next_cursor_cell();
+                    if self.next_cursor_cell(&mut uiflags).is_none() {
+                        break;
+                    }
                 } else {
-                    return self.next_cursor();
+                    output = self.next_cursor(&mut uiflags);
+                    break;
                 }
+            } else if let Some(cell) = self.inner.next() {
+                let point = Point::new(cell.line, cell.column);
+                let selected = self.is_selected(point);
+                let search_matched = self.search.advance(self.grid.visible_to_buffer(point));
+                let has_wide_char_spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+                // skip empty cells and wide char spacers.
+                if (cell.is_empty() || has_wide_char_spacer) && !selected && !search_matched {
+                    continue;
+                }
+                let mut uiflags = UIFlags::empty();
+                if selected {
+                    uiflags |= UIFlags::SELECTED;
+                }
+                if search_matched {
+                    uiflags |= UIFlags::SEARCH_MATCHED;
+                    if let Some(viewport_match) = &self.viewport_match {
+                        if viewport_match.contains(&point) {
+                            uiflags |= UIFlags::FOCUSED_MATCH;
+                        }
+                    }
+                }
+                if self.latest_col.is_none() || self.run_start.is_none() {
+                    // Initial state, this should only be hit on the first next() call of
+                    // iterator
+                    self.run_start = Some(RunStart {
+                        line: cell.line,
+                        column: cell.column,
+                        fg: cell.fg,
+                        bg: cell.bg,
+                        uiflags,
+                        flags: cell.flags,
+                    });
+                } else if self.is_end_of_run(&cell, uiflags) {
+                    // If we find a run break, return what we have so far and start a new run.
+                    output = self.produce_char_run(cell, uiflags);
+                    break;
+                }
+                // Build up buffer and track the latest column we've seen
+                let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+                self.latest_col = Some((cell.column, width));
+                self.buffer_content(&cell);
             } else {
-                // Handle non-cursor cells.
-                let cell = self.inner.next()?;
-                let cell = RenderableCell::new(self, cell);
-
-                // Skip empty cells and wide char spacers.
-                if !cell.is_empty() && !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    return Some(cell);
-                }
+                break;
             }
         }
+        // Check for any remaining buffered content and return it as a text run.
+        // This is a destructive operation, it will return None after it executes once.
+        output.or_else(|| {
+            if !self.buffer_text.is_empty() || !self.buffer_extra.is_empty() {
+                let start = self.run_start.take()?;
+                let latest_col = self.latest_col.take()?;
+                // Save leftover buffer and empty it
+                let prev_buffered = self.drain_buffer();
+                Some(self.build_text_run(start, latest_col, prev_buffered))
+            } else {
+                None
+            }
+        })
     }
 }
 
-impl<'a, C> RenderableCellsIter<'a, C> {
+impl<'a, C> TextRunIter<'a, C> {
     /// Create the renderable cells iterator.
     ///
     /// The cursor and terminal mode are required for properly displaying the
@@ -182,8 +257,9 @@ impl<'a, C> RenderableCellsIter<'a, C> {
         term: &'a Term<T>,
         config: &'a Config<C>,
         show_cursor: bool,
-    ) -> RenderableCellsIter<'a, C> {
-        RenderableCellsIter {
+        viewport_match: Option<RangeInclusive<Point>>,
+    ) -> TextRunIter<'a, C> {
+        TextRunIter {
             cursor: term.renderable_cursor(config, show_cursor),
             grid: &term.grid,
             inner: term.grid.display_iter(),
@@ -191,52 +267,170 @@ impl<'a, C> RenderableCellsIter<'a, C> {
             config,
             colors: &term.colors,
             search: RenderableSearch::new(term),
+            latest_col: None,
+            run_start: None,
+            buffer_text: String::new(),
+            buffer_extra: Vec::new(),
+            viewport_match,
         }
     }
 
-    /// Get the next renderable cell as the cell below the cursor.
-    fn next_cursor_cell(&mut self) -> Option<RenderableCell> {
+    /// Get the next textrun as the cell below the cursor.
+    fn next_cursor_cell(&mut self, uiflags: &mut UIFlags) -> Option<()> {
         // Handle cell below cursor.
         let cell = self.inner.next()?;
-        let mut cell = RenderableCell::new(self, cell);
-
         if self.cursor.key.shape == CursorShape::Block {
-            cell.fg = match self.cursor.cursor_color {
-                // Apply cursor color, or invert the cursor if it has a fixed background
-                // close to the cell's background.
-                CellRgb::Rgb(col) if col.contrast(cell.bg) < MIN_CURSOR_CONTRAST => cell.bg,
-                _ => self.cursor.text_color.color(cell.fg, cell.bg),
-            };
+            *uiflags |= UIFlags::BLOCK | UIFlags::CURSOR;
         }
-
-        Some(cell)
+        self.run_start = Some(RunStart {
+            line: cell.line,
+            column: cell.column,
+            fg: cell.fg,
+            bg: cell.bg,
+            uiflags: *uiflags,
+            flags: cell.flags,
+        });
+        let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+        self.latest_col = Some((cell.column, width));
+        self.buffer_content(&cell);
+        Some(())
     }
 
-    /// Get the next renderable cell as the cursor.
-    fn next_cursor(&mut self) -> Option<RenderableCell> {
-        // Handle cursor.
+    /// Get the next textrun as the cursor
+    fn next_cursor(&mut self, uiflags: &mut UIFlags) -> Option<TextRun> {
+        // Handle cursor
+        if !self.buffer_text.is_empty() || !self.buffer_extra.is_empty() {
+            return None;
+        }
         self.cursor.rendered = true;
-
         let buffer_point = self.grid.visible_to_buffer(self.cursor.point);
         let cell = Indexed {
             inner: &self.grid[buffer_point.line][buffer_point.col],
             column: self.cursor.point.col,
             line: self.cursor.point.line,
         };
+        *uiflags |= UIFlags::CURSOR;
+        Some(self.produce_cursor(cell, *uiflags))
+    }
 
-        let mut cell = RenderableCell::new(self, cell);
-        cell.inner = RenderableCellContent::Cursor(self.cursor.key);
-
-        // Apply cursor color, or invert the cursor if it has a fixed background close
-        // to the cell's background.
-        if !matches!(
-            self.cursor.cursor_color,
-            CellRgb::Rgb(color) if color.contrast(cell.bg) < MIN_CURSOR_CONTRAST
-        ) {
-            cell.fg = self.cursor.cursor_color.color(cell.fg, cell.bg);
+    /// Check if current run ends at incoming Cell.
+    /// Run will not include incoming Cell if it ends.
+    fn is_end_of_run(&self, cell: &Indexed<&Cell>, uiflags: UIFlags) -> bool {
+        // does cell not belong to run
+        if let Some(run_start) = &self.run_start {
+            if !run_start.belongs_to_text_run(cell, uiflags) {
+                return true;
+            }
         }
+        // is column not adjacent
+        if let Some((col, width)) = self.latest_col {
+            col + width != cell.column && cell.column + width != col
+        } else {
+            false
+        }
+    }
 
-        Some(cell)
+    /// Add content of cell to pending TextRun buffer
+    fn buffer_content(&mut self, cell: &Indexed<&Cell>) {
+        // Render tab as spaces in case the font doesn't support it.
+        if cell.c == '\t' {
+            self.buffer_text.push(' ');
+        } else {
+            self.buffer_text.push(cell.c);
+        }
+        self.buffer_extra.push(cell.zerowidth().map(|z| z.to_vec()));
+    }
+
+    /// Empty out pending buffer producing owned collections that can be moved into a TextRun.
+    fn drain_buffer(&mut self) -> (String, Vec<Option<Vec<char>>>) {
+        (self.buffer_text.split_off(0), self.buffer_extra.split_off(0))
+    }
+
+    /// Start a new run by setting latest_col, run_start and buffering content of cell.
+    /// Returns the previous runs run_start and latest_col data if available.
+    fn start_run(
+        &mut self,
+        cell: Indexed<&Cell>,
+        uiflags: UIFlags,
+    ) -> (Option<RunStart>, Option<LatestCol>) {
+        self.buffer_content(&cell);
+        let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+        let latest = self.latest_col.replace((cell.column, width));
+        let start = self.run_start.replace(RunStart {
+            line: cell.line,
+            column: cell.column,
+            fg: cell.fg,
+            bg: cell.bg,
+            uiflags,
+            flags: cell.flags,
+        });
+        (start, latest)
+    }
+
+    /// Produce a run containing a single cursor from state of the `TextRunIter`.
+    /// This is a destructive operation, the iterator will be in a new run state after it's
+    /// completion.
+    fn produce_cursor(&mut self, cell: Indexed<&Cell>, uiflags: UIFlags) -> TextRun {
+        let start = RunStart {
+            line: cell.line,
+            column: cell.column,
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags,
+            uiflags,
+        };
+        let (mut fg, bg, bg_alpha) =
+            RenderableCell::color_to_rgb(self.config, self.colors, &start, &self.cursor);
+        // Apply cursor color invert if it has a fixed background close
+        // to the cell's background.
+        if !matches!(self.cursor.cursor_color,
+            CellRgb::Rgb(color) if color.contrast(bg) < MIN_CURSOR_CONTRAST)
+        {
+            fg = self.cursor.cursor_color.color(fg, bg);
+        }
+        TextRun {
+            line: start.line,
+            span: (start.column, start.column),
+            content: TextRunContent::Cursor(self.cursor.key),
+            fg,
+            bg,
+            bg_alpha,
+            flags: start.flags,
+            data: None,
+        }
+    }
+
+    /// Create a run of chars from the current state of `TextRunIter`.
+    /// This is a destructive operation, the iterator will be in a new run state after it's
+    /// completion.
+    fn produce_char_run(&mut self, cell: Indexed<&Cell>, uiflags: UIFlags) -> Option<TextRun> {
+        let prev_buffer = self.drain_buffer();
+        let (start_opt, latest_col_opt) = self.start_run(cell, uiflags);
+        let start = start_opt?;
+        let latest_col = latest_col_opt?;
+        Some(self.build_text_run(start, latest_col, prev_buffer))
+    }
+
+    /// Build a TextRun instance from passed state of TextRunIter
+    fn build_text_run(
+        &self,
+        start: RunStart,
+        (latest, width): LatestCol,
+        buffer: (String, Vec<Option<Vec<char>>>),
+    ) -> TextRun {
+        let end_column = latest + width - 1;
+        let (fg, bg, bg_alpha) =
+            RenderableCell::color_to_rgb(self.config, self.colors, &start, &self.cursor);
+        TextRun {
+            line: start.line,
+            span: (start.column, end_column),
+            content: TextRunContent::CharRun(buffer.0, buffer.1),
+            fg,
+            bg,
+            bg_alpha,
+            flags: start.flags,
+            data: None,
+        }
     }
 
     /// Check selection state of a cell.
@@ -306,71 +500,79 @@ pub struct RenderableCell {
 }
 
 impl RenderableCell {
-    fn new<'a, C>(iter: &mut RenderableCellsIter<'a, C>, cell: Indexed<&Cell>) -> Self {
-        let point = Point::new(cell.line, cell.column);
-
+    #[inline]
+    fn color_to_rgb<C>(
+        config: &Config<C>,
+        colors: &color::List,
+        cell: &RunStart,
+        cursor: &RenderableCursor,
+    ) -> (Rgb, Rgb, f32) {
         // Lookup RGB values.
-        let mut fg_rgb = Self::compute_fg_rgb(iter.config, iter.colors, cell.fg, cell.flags);
-        let mut bg_rgb = Self::compute_bg_rgb(iter.colors, cell.bg);
-
+        let mut fg_rgb = Self::compute_fg_rgb(config, colors, cell.fg, cell.flags);
+        let mut bg_rgb = Self::compute_bg_rgb(colors, cell.bg);
         let mut bg_alpha = if cell.flags.contains(Flags::INVERSE) {
             mem::swap(&mut fg_rgb, &mut bg_rgb);
             1.0
         } else {
             Self::compute_bg_alpha(cell.bg)
         };
-
-        let mut is_match = false;
-
-        if iter.is_selected(point) {
-            let config_bg = iter.config.colors.selection.background();
-            let selected_fg = iter.config.colors.selection.foreground().color(fg_rgb, bg_rgb);
+        if cell.uiflags.contains(UIFlags::SELECTED) {
+            let config_bg = config.colors.selection.background();
+            let selected_fg = config.colors.selection.foreground().color(fg_rgb, bg_rgb);
             bg_rgb = config_bg.color(fg_rgb, bg_rgb);
             fg_rgb = selected_fg;
-
             if fg_rgb == bg_rgb && !cell.flags.contains(Flags::HIDDEN) {
                 // Reveal inversed text when fg/bg is the same.
-                fg_rgb = iter.colors[NamedColor::Background];
-                bg_rgb = iter.colors[NamedColor::Foreground];
+                fg_rgb = colors[NamedColor::Background];
+                bg_rgb = colors[NamedColor::Foreground];
                 bg_alpha = 1.0;
             } else if config_bg != CellRgb::CellBackground {
                 bg_alpha = 1.0;
             }
-        } else if iter.search.advance(iter.grid.visible_to_buffer(point)) {
+        } else if cell.uiflags.contains(UIFlags::SEARCH_MATCHED) {
             // Highlight the cell if it is part of a search match.
-            let config_bg = iter.config.colors.search.matches.background;
-            let matched_fg = iter.config.colors.search.matches.foreground.color(fg_rgb, bg_rgb);
+            let config_bg = config.colors.search.matches.background;
+            let matched_fg = config.colors.search.matches.foreground.color(fg_rgb, bg_rgb);
             bg_rgb = config_bg.color(fg_rgb, bg_rgb);
             fg_rgb = matched_fg;
 
             if config_bg != CellRgb::CellBackground {
                 bg_alpha = 1.0;
             }
-
-            is_match = true;
+        }
+        if cell.uiflags.contains(UIFlags::FOCUSED_MATCH) {
+            let colors = config.colors.search.focused_match;
+            let matched_fg = colors.foreground().color(fg_rgb, bg_rgb);
+            bg_rgb = colors.background().color(fg_rgb, bg_rgb);
+            fg_rgb = matched_fg;
+            bg_alpha = 1.0;
         }
 
-        let zerowidth = cell.zerowidth().map(|zerowidth| zerowidth.to_vec());
-
-        RenderableCell {
-            line: cell.line,
-            column: cell.column,
-            inner: RenderableCellContent::Chars((cell.c, zerowidth)),
-            fg: fg_rgb,
-            bg: bg_rgb,
-            bg_alpha,
-            flags: cell.flags,
-            is_match,
+        // Apply cursor color, or invert the cursor if it has a fixed background close to the
+        // cell's background.
+        if cell.uiflags.contains(UIFlags::CURSOR | UIFlags::BLOCK) {
+            fg_rgb = match cursor.cursor_color {
+                CellRgb::Rgb(col) if col.contrast(bg_rgb) < MIN_CURSOR_CONTRAST => bg_rgb,
+                _ => cursor.text_color.color(fg_rgb, bg_rgb),
+            };
         }
+        (fg_rgb, bg_rgb, bg_alpha)
     }
 
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.bg_alpha == 0.
             && !self.flags.intersects(Flags::UNDERLINE | Flags::STRIKEOUT | Flags::DOUBLE_UNDERLINE)
             && self.inner == RenderableCellContent::Chars((' ', None))
     }
 
-    fn compute_fg_rgb<C>(config: &Config<C>, colors: &color::List, fg: Color, flags: Flags) -> Rgb {
+    #[inline]
+    pub fn compute_fg_rgb<C>(
+        config: &Config<C>,
+        colors: &color::List,
+        fg: Color,
+        flags: Flags,
+    ) -> Rgb {
         match fg {
             Color::Spec(rgb) => match flags & Flags::DIM {
                 Flags::DIM => rgb * DIM_FACTOR,
@@ -416,7 +618,7 @@ impl RenderableCell {
     /// using the named input color, rather than checking the RGB of the background after its color
     /// is computed.
     #[inline]
-    fn compute_bg_alpha(bg: Color) -> f32 {
+    pub fn compute_bg_alpha(bg: Color) -> f32 {
         if bg == Color::Named(NamedColor::Background) {
             0.
         } else {
@@ -425,7 +627,7 @@ impl RenderableCell {
     }
 
     #[inline]
-    fn compute_bg_rgb(colors: &color::List, bg: Color) -> Rgb {
+    pub fn compute_bg_rgb(colors: &color::List, bg: Color) -> Rgb {
         match bg {
             Color::Spec(rgb) => rgb,
             Color::Named(ansi) => colors[ansi],
@@ -475,6 +677,7 @@ pub mod mode {
 
 pub use crate::term::mode::TermMode;
 
+#[derive(Clone)]
 pub struct VisualBell {
     /// Visual bell animation.
     animation: BellAnimation,
@@ -1020,17 +1223,17 @@ impl<T> Term<T> {
         &mut self.grid
     }
 
-    /// Iterate over the *renderable* cells in the terminal.
+    /// Iterate over the text runs in the terminal
     ///
-    /// A renderable cell is any cell which has content other than the default
-    /// background color.  Cells with an alternate background color are
-    /// considered renderable as are cells with any text content.
-    pub fn renderable_cells<'b, C>(
+    /// A text run is a continuous line of cells that all share the same rendering properties
+    /// (background color, foreground color, etc.).
+    pub fn text_runs<'b, C>(
         &'b self,
         config: &'b Config<C>,
         show_cursor: bool,
-    ) -> RenderableCellsIter<'_, C> {
-        RenderableCellsIter::new(&self, config, show_cursor)
+        viewport_match: Option<RangeInclusive<Point>>,
+    ) -> TextRunIter<'_, C> {
+        TextRunIter::new(&self, config, show_cursor, viewport_match)
     }
 
     /// Get the selection within the viewport.
@@ -2416,6 +2619,7 @@ pub enum ClipboardType {
     Selection,
 }
 
+#[derive(Clone)]
 struct TabStops {
     tabs: Vec<bool>,
 }

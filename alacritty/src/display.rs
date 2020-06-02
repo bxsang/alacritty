@@ -1,6 +1,7 @@
 //! The display subsystem including window management, font rasterization, and
 //! GPU drawing.
 
+use linked_hash_map::LinkedHashMap;
 use std::cmp::min;
 use std::f64;
 use std::fmt::{self, Formatter};
@@ -29,6 +30,7 @@ use alacritty_terminal::index::{Column, Direction, Point};
 use alacritty_terminal::selection::Selection;
 use alacritty_terminal::term::{SizeInfo, Term, TermMode};
 use alacritty_terminal::term::{MIN_COLS, MIN_SCREEN_LINES};
+use alacritty_terminal::text_run::TextRun;
 
 use crate::config::font::Font;
 use crate::config::window::Dimensions;
@@ -38,7 +40,7 @@ use crate::config::Config;
 use crate::event::{Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::meter::Meter;
-use crate::renderer::rects::{RenderLines, RenderRect};
+use crate::renderer::rects::RenderRect;
 use crate::renderer::{self, GlyphCache, QuadRenderer};
 use crate::url::{Url, Urls};
 use crate::window::{self, Window};
@@ -165,6 +167,7 @@ pub struct Display {
 
     renderer: QuadRenderer,
     glyph_cache: GlyphCache,
+    text_run_cache: LinkedHashMap<u64, TextRun>,
     meter: Meter,
 }
 
@@ -291,6 +294,7 @@ impl Display {
             _ => (),
         }
 
+        let cell_nums = size_info.screen_lines().0 * size_info.cols().0;
         Ok(Self {
             window,
             renderer,
@@ -304,6 +308,7 @@ impl Display {
             #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
             wayland_event_queue,
             cursor_hidden: false,
+            text_run_cache: LinkedHashMap::with_capacity(cell_nums * 2),
         })
     }
 
@@ -313,7 +318,11 @@ impl Display {
         config: &Config,
     ) -> Result<(GlyphCache, f32, f32), Error> {
         let font = config.ui_config.font.clone();
-        let rasterizer = Rasterizer::new(dpr as f32, config.ui_config.font.use_thin_strokes())?;
+        let rasterizer = Rasterizer::new(
+            dpr as f32,
+            config.ui_config.font.use_thin_strokes(),
+            config.ui_config.font.ligatures(),
+        )?;
 
         // Initialize glyph cache.
         let glyph_cache = {
@@ -359,6 +368,7 @@ impl Display {
         self.renderer.with_loader(|mut api| {
             cache.clear_glyph_cache(&mut api);
         });
+        self.text_run_cache.clear();
     }
 
     /// Process update events.
@@ -381,8 +391,8 @@ impl Display {
             let cell_dimensions = self.update_glyph_cache(config, font);
             cell_width = cell_dimensions.0;
             cell_height = cell_dimensions.1;
-
             info!("Cell size: {} x {}", cell_width, cell_height);
+            self.text_run_cache.clear();
         } else if update_pending.cursor_dirty() {
             self.clear_glyph_cache();
         }
@@ -425,6 +435,16 @@ impl Display {
 
         info!("Padding: {} x {}", self.size_info.padding_x(), self.size_info.padding_y());
         info!("Width: {}, Height: {}", self.size_info.width(), self.size_info.height());
+        let target_capacity = self.size_info.screen_lines().0 * self.size_info.cols().0 * 2;
+        let cache_capacity = self.text_run_cache.capacity();
+        if target_capacity > cache_capacity {
+            self.text_run_cache.reserve(target_capacity - cache_capacity);
+        } else {
+            while self.text_run_cache.len() > target_capacity {
+                self.text_run_cache.pop_front();
+            }
+            self.text_run_cache.shrink_to_fit();
+        }
     }
 
     /// Draw the screen.
@@ -442,13 +462,13 @@ impl Display {
         search_state: &SearchState,
     ) {
         // Convert search match from viewport to absolute indexing.
-        let search_active = search_state.regex().is_some();
         let viewport_match = search_state
             .focused_match()
             .and_then(|focused_match| terminal.grid().clamp_buffer_range_to_visible(focused_match));
         let cursor_hidden = self.cursor_hidden || search_state.regex().is_some();
 
-        let grid_cells = terminal.renderable_cells(config, !cursor_hidden).collect::<Vec<_>>();
+        let grid_text_runs: Vec<TextRun> =
+            terminal.text_runs(config, !cursor_hidden, viewport_match).collect();
         let visual_bell_intensity = terminal.visual_bell.intensity();
         let background_color = terminal.background_color();
         let cursor_point = terminal.grid().cursor.point;
@@ -473,43 +493,63 @@ impl Display {
             api.clear(background_color);
         });
 
-        let mut lines = RenderLines::new();
         let mut urls = Urls::new();
+        let mut rects = vec![];
 
         // Draw grid.
         {
             let _sampler = self.meter.sampler();
+            let _text_run_cache = &mut self.text_run_cache;
+            let target_capacity = self.size_info.screen_lines().0 * self.size_info.cols().0 * 2;
 
             self.renderer.with_api(&config.ui_config, config.cursor, &size_info, |mut api| {
-                // Iterate over all non-empty cells in the grid.
-                for mut cell in grid_cells {
-                    // Invert the active match in vi-less search.
-                    let cell_point = Point::new(cell.line, cell.column);
-                    if cell.is_match
-                        && viewport_match
-                            .as_ref()
-                            .map_or(false, |viewport_match| viewport_match.contains(&cell_point))
-                    {
-                        let colors = config.colors.search.focused_match;
-                        let match_fg = colors.foreground().color(cell.fg, cell.bg);
-                        cell.bg = colors.background().color(cell.fg, cell.bg);
-                        cell.fg = match_fg;
-                        cell.bg_alpha = 1.0;
-                    }
-
+                let grid_length = grid_text_runs.len();
+                #[allow(unused_mut)]
+                let mut hit = 0;
+                // Iterate over all non-empty text_runs in the grid.
+                #[allow(unused_mut)]
+                for mut text_run in grid_text_runs.into_iter() {
                     // Update URL underlines.
-                    urls.update(size_info.cols(), &cell);
-
+                    urls.update(size_info.cols(), &text_run);
                     // Update underline/strikeout.
-                    lines.update(&cell);
-
-                    // Draw the cell.
-                    api.render_cell(cell, glyph_cache);
+                    rects.extend(RenderRect::all_from_text_run(&text_run, &metrics, &size_info));
+                    if config.ui_config.font.ligatures() {
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = rustc_hash::FxHasher::default();
+                        text_run.hash(&mut hasher);
+                        let key = hasher.finish();
+                        if let Some(text_run_with_data) = _text_run_cache.get_refresh(&key) {
+                            if text_run.eq(text_run_with_data) {
+                                hit += 1;
+                                text_run.update_to_data(text_run_with_data);
+                                api.render_text_run_with_data(text_run_with_data, glyph_cache);
+                                continue;
+                            }
+                        }
+                        api.render_text_run_with_data(&mut text_run, glyph_cache);
+                        _text_run_cache.insert(key, text_run);
+                    } else {
+                        api.render_text_run(&text_run, glyph_cache);
+                    }
+                }
+                if config.ui_config.font.ligatures() {
+                    let cache_capacity = _text_run_cache.capacity();
+                    if target_capacity > cache_capacity {
+                        _text_run_cache.reserve(target_capacity - cache_capacity);
+                    } else {
+                        while _text_run_cache.len() > target_capacity {
+                            _text_run_cache.pop_front();
+                        }
+                        _text_run_cache.shrink_to_fit();
+                    }
+                    info!(
+                        "hit rate: {:.3}, total {}",
+                        hit as f64 / grid_length as f64,
+                        grid_length
+                    );
                 }
             });
         }
-
-        let mut rects = lines.rects(&metrics, &size_info);
 
         // Update visible URLs.
         self.urls = urls;
@@ -550,7 +590,7 @@ impl Display {
         }
 
         if let Some(message) = message_buffer.message() {
-            let search_offset = if search_active { 1 } else { 0 };
+            let search_offset = if cursor_hidden { 1 } else { 0 };
             let text = message.text(&size_info);
 
             // Create a new rectangle for the background.
